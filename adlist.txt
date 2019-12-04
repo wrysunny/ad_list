@@ -1,8 +1,8 @@
-p.clkservice.youdao.com
-adaccount.csdn.net
-kunyu.csdn.net
-f12.baidu.com
-mssp.baidu.com
-cpro.baidu.com
-t11.baidu.com
-yingxiao.baidu.com
+127.0.0.1 p.clkservice.youdao.com
+127.0.0.1 adaccount.csdn.net
+127.0.0.1 kunyu.csdn.net
+127.0.0.1 f12.baidu.com
+127.0.0.1 mssp.baidu.com
+127.0.0.1 cpro.baidu.com
+127.0.0.1 t11.baidu.com
+127.0.0.1 yingxiao.baidu.com
