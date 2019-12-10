@@ -51,8 +51,13 @@
 ||dsp-impr*.youdao.com^$app=com.youdao.dict
 ||xue.youdao.com^
 !jb51
-||files.jb51.net^
+.jb51.net.wswebpic.com
+||files.jb51.net/image/
+||icws.jb51.net/good/arc2019.js
 !baidu统计
-||hm.baidu.com/hm.gif
+.baidu.com/h.
+||hm.baidu.com^
 !cnzz
 ||cnzz.com^
+||cnzz.com^$third-party
+
