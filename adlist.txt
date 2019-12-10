@@ -51,7 +51,7 @@
 ||dsp-impr*.youdao.com^$app=com.youdao.dict
 ||xue.youdao.com^
 !jb51
-||files.jb51.net/image/
+||files.jb51.net^
 !baidu统计
 ||hm.baidu.com/hm.gif
 !cnzz
