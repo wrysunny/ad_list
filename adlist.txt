@@ -1,11 +1,52 @@
-127.0.0.1 p.clkservice.youdao.com
-127.0.0.1 adaccount.csdn.net
-127.0.0.1 kunyu.csdn.net
-127.0.0.1 f12.baidu.com
-127.0.0.1 mssp.baidu.com
-127.0.0.1 cpro.baidu.com
-127.0.0.1 t11.baidu.com
-127.0.0.1 yingxiao.baidu.com
-127.0.0.1 hm.baidu.com
-127.0.0.1 c.cnzz.com
-127.0.0.1 files.jb51.net
+!抖音广告过滤
+||v.admaster.com.cn^$app=com.ss.android.ugc.aweme
+||st.360buyimg.com^$domain=pro.m.jd.com,app=com.ss.android.ugc.aweme
+||img14.360buyimg.com^$domain=pro.m.jd.com,app=com.ss.android.ugc.aweme
+||storage.360buyimg.com^$domain=pro.m.jd.com,app=com.ss.android.ugc.aweme
+||m.360buyimg.com^$domain=pro.m.jd.com,app=com.ss.android.ugc.aweme
+!QQ广告过滤
+||act.qzone.qq.com^$app=com.tencent.mobileqq
+||report.huatuo.qq.com^$app=com.tencent.mobileqq
+||m.qpic.cn^$domain=v1_and_sq_7.7.0_884_yyb_d-0-4,app=com.tencent.mobileqq
+||qqpublic.qpic.cn^$app=com.tencent.mobileqq
+||story.cdn.qq.com^$app=com.tencent.mobileqq
+||buluo.qq.com^$app=com.tencent.mobileqq
+||huatuocode.weiyun.com^$domain=act.qzone.qq.com,app=com.tencent.mobileqq
+||pingtas.qq.com^$domain=act.qzone.qq.com,app=com.tencent.mobileqq
+||pingfore.qq.com^$domain=act.qzone.qq.com,app=com.tencent.mobileqq
+||log.tbs.qq.com/ajax?c^$app=com.tencent.mobileqq
+||p.qpic.cn/qqstory_pic^$app=com.tencent.mobileqq
+||huatuospeed.weiyun.com^$domain=act.qzone.qq.com,app=com.tencent.mobileqq
+||sngmta.qq.com:80/mstat/report^$app=com.tencent.mobileqq
+!网易云音乐广告过滤
+||interface.music.163.com/eapi/ad^$app=com.netease.cloudmusic
+||only-819159-49-85-20-157.nstool.netease.com^$app=com.netease.cloudmusic
+!微信广告过滤
+||short.weixin.qq.com^$app=com.tencent.mm
+！||extshort.weixin.qq.com^$app=com.tencent.mm
+||mp.weixin.qq.com/mp/advertisement_report
+||mp.weixin.qq.com/mp/ad_biz_info?__biz=
+||mp.weixin.qq.com/mp/jsreport?key=
+||mp.weixin.qq.com/mp/jsmonitor?idkey=
+||wxsnsdythumb.wxs.qq.com^$app=com.tencent.mm
+||wxsnsdythumb.wxs.qq.com^$app=com.tencent.mm
+||mp.weixin.qq.com/mp/appmsgrepor t?action
+||pgdt.gtimg.cn^
+||wspeed.qq.com^
+||p.store.qq.com^
+@@||short.weixin.qq.com/mmtls^$app=com.tencent.mm
+||mp.weixin.qq.com/mp/advertisement^
+||mp.weixin.qq.com/mp/getappmsgad^
+||logs.chelaile.net.cn$app=com.tencent.mm
+||api.chelaile.net.cn$app=com.tencent.mm
+||wxsnsdy.wxs.qq.com^$app=com.tencent.mm
+! 有道词典广告过滤，去除除查词外多余功能
+||oimagea*.ydstatic.com^$app=com.youdao.dict
+||ke.youdao.com^$app=com.youdao.dict
+||ke.youdao.com^$app=com.youdao.dict
+||oimageb*.ydstatic.com^$app=com.youdao.dict
+||dict.youdao.com/infoline?$app=com.youdao.dict
+||dict.youdao.com/infoline?mode=publish&client
+||gorgon.youdao.com^$app=com.youdao.dict
+||dsp-impr*.youdao.com^$app=com.youdao.dict
+||xue.youdao.com^
