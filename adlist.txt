@@ -7,3 +7,5 @@
 127.0.0.1 t11.baidu.com
 127.0.0.1 yingxiao.baidu.com
 127.0.0.1 hm.baidu.com
+127.0.0.1 c.cnzz.com
+127.0.0.1 files.jb51.net
