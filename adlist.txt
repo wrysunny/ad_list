@@ -23,7 +23,7 @@
 ||only-819159-49-85-20-157.nstool.netease.com^$app=com.netease.cloudmusic
 !微信广告过滤
 ||short.weixin.qq.com^$app=com.tencent.mm
-！||extshort.weixin.qq.com^$app=com.tencent.mm
+!||extshort.weixin.qq.com^$app=com.tencent.mm
 ||mp.weixin.qq.com/mp/advertisement_report
 ||mp.weixin.qq.com/mp/ad_biz_info?__biz=
 ||mp.weixin.qq.com/mp/jsreport?key=
@@ -40,7 +40,7 @@
 ||logs.chelaile.net.cn$app=com.tencent.mm
 ||api.chelaile.net.cn$app=com.tencent.mm
 ||wxsnsdy.wxs.qq.com^$app=com.tencent.mm
-! 有道词典广告过滤，去除除查词外多余功能
+!有道词典广告过滤，去除除查词外多余功能
 ||oimagea*.ydstatic.com^$app=com.youdao.dict
 ||ke.youdao.com^$app=com.youdao.dict
 ||ke.youdao.com^$app=com.youdao.dict
@@ -50,3 +50,9 @@
 ||gorgon.youdao.com^$app=com.youdao.dict
 ||dsp-impr*.youdao.com^$app=com.youdao.dict
 ||xue.youdao.com^
+!jb51
+||files.jb51.net/image/
+!baidu统计
+||hm.baidu.com/hm.gif
+!cnzz
+||cnzz.com^
