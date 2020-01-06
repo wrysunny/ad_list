@@ -34,3 +34,41 @@
 ||btrace.qq.com^
 ||btrace.video.qq.com^
 ||log.tbs.qq.com^
+||sngmta.qq.com^
+||beacon.qq.com^
+||bugly.qq.com^
+
+# 抖音
+||mon.snssdk.com^
+||dm.toutiao.com^
+
+# 美团
+||api-unionid.meituan.com^
+||hreport.meituan.com^
+
+# 魅族
+||norma-external-collect.meizu.com^
+
+# 有道
+||ydpushserver.youdao.com^
+||fanyiegg.youdao.com^
+||foundation.youdao.com^
+||gorgon.youdao.com^
+||impservice.dictapp.youdao.com^
+||gorgon.youdao.com^
+
+# WPS
+||getui.com^
+||api.touchxd.com^
+
+
+# 爱加固
+||appjiagu.com^
+
+
+# Others
+||crashlytics.com^
+
+# 鲨鱼记账
+||shayujizhang.com^
+
