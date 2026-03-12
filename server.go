@@ -274,14 +274,14 @@ func (s *serverTunnelState) tcpReplyLoop(key string, sess *tcpProxySession) {
 
 	buf := make([]byte, 16*1024)
 	for {
-		sess.mu.Lock()
 		_ = sess.conn.SetReadDeadline(time.Now().Add(tcpSessionTimeout))
 		n, err := sess.conn.Read(buf)
 		if n > 0 {
+			sess.mu.Lock()
 			sess.LastActive = time.Now()
 			sess.HeartbeatTime = time.Now()
+			sess.mu.Unlock()
 		}
-		sess.mu.Unlock()
 		if n > 0 {
 			incTCPToClient(uint64(n))
 			reply := ProxyType{Type: 1, Src: sess.dest, Dest: sess.src, Payload: append([]byte(nil), buf[:n]...)}
@@ -338,13 +338,13 @@ func (s *serverTunnelState) udpReplyLoop(key string, sess *udpProxySession) {
 	}()
 	buf := make([]byte, 64*1024)
 	for {
-		sess.mu.Lock()
 		_ = sess.conn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
 		n, err := sess.conn.Read(buf)
 		if n > 0 {
+			sess.mu.Lock()
 			sess.LastActive = time.Now()
+			sess.mu.Unlock()
 		}
-		sess.mu.Unlock()
 		if n > 0 {
 			incUDPToClient(uint64(n))
 			reply := ProxyType{Type: 0, Src: sess.dest, Dest: sess.src, Payload: append([]byte(nil), buf[:n]...)}

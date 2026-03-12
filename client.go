@@ -203,7 +203,7 @@ func (c *socksClient) handleSocksConn(conn net.Conn) {
 
 	switch cmd {
 	case 0x01:
-		if err := c.handleConnect(conn, host, port); err != nil {
+		if err := c.handleConnect(conn, host, port); err != nil && err != io.EOF {
 			log.Println("socks connect error:", err)
 		}
 	case 0x03:
