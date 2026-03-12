@@ -3,13 +3,15 @@ package websocket_proxy
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/gorilla/websocket"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
@@ -17,225 +19,239 @@ var upgrader = websocket.Upgrader{
 	EnableCompression: true,
 	ReadBufferSize:    1024 * 16,
 	WriteBufferSize:   1024 * 16,
-	// 允许跨域（生产环境建议做严格检查）
 	CheckOrigin: func(r *http.Request) bool {
 		h := r.Header.Get("Origin")
-		if h == "" || h == "chrome-extension://enmpedlkjjjnhoehlkkghdjiloebecpn" || strings.Contains(strings.ToLower(h), trustDomain) {
-			return true
-		}
-		return false
+		return h == "" || h == "chrome-extension://enmpedlkjjjnhoehlkkghdjiloebecpn" || strings.Contains(strings.ToLower(h), trustDomain)
 	},
 }
 
 func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Upgrade error:", err)
+		log.Println("upgrade error:", err)
 		return
 	}
 	defer wsConn.Close()
 
-	wsCtx := &WSConnectionContext{
-		SessionPrefix: generateSessionPrefix(),
-	}
-	// === 本 WS 连接专属的会话管理（实现端口复用）===
-	var (
-		tcpSessions = make(map[string]*tcpProxySession)
-		//udpSessions = make(map[string]*udpProxySession)
-		sessionMu sync.Mutex // 会话表锁
-		// 新增：消息通道，解耦读取和处理，支持并发
-		msgChan  = make(chan []byte, 1024) // 带缓冲，防止阻塞
-		stopChan = make(chan struct{})
-	)
+	wsCtx := &WSConnectionContext{SessionPrefix: generateSessionPrefix()}
+	state := newServerTunnelState(wsConn, wsCtx)
+	defer state.closeAll()
 
-	go func() {
-		defer close(msgChan)
-		for {
-			select {
-			case <-stopChan:
-				return
-			default:
-				t, p, err := wsConn.ReadMessage()
-				if err != nil {
-					//log.Println("Read error:", err)
-					return
-				}
-				switch t {
-				case websocket.PingMessage:
-					wsCtx.writeMu.Lock()
-					wsConn.WriteMessage(websocket.PongMessage, p)
-					wsCtx.writeMu.Unlock()
-				case websocket.CloseMessage:
-					wsCtx.writeMu.Lock()
-					wsConn.WriteMessage(websocket.CloseMessage, nil)
-					wsCtx.writeMu.Unlock()
-					return
-				case websocket.TextMessage:
-					wsCtx.writeMu.Lock()
-					wsConn.WriteMessage(websocket.TextMessage, []byte("ok"))
-					wsCtx.writeMu.Unlock()
-				case websocket.BinaryMessage:
-					// 解密后放入消息通道，由消费协程处理
-					decrypted, err := DecryptWithGzip(p, Key)
-					if err != nil {
-						log.Println(err)
-						continue
-					}
-					if len(decrypted) == 0 {
-						continue
-					}
-					if decrypted[0] == 1 { // TCP
-						select {
-						case msgChan <- decrypted:
-						case <-time.After(1 * time.Second): // 流量控制：超时丢弃，防止通道阻塞
-							log.Println("msgChan full, drop message")
-						}
-					}
-				}
+	for {
+		t, payload, err := wsConn.ReadMessage()
+		if err != nil {
+			return
+		}
+		switch t {
+		case websocket.PingMessage:
+			state.writeMu.Lock()
+			_ = wsConn.WriteMessage(websocket.PongMessage, payload)
+			state.writeMu.Unlock()
+		case websocket.BinaryMessage:
+			data, err := DecryptWithGzip(payload, Key)
+			if err != nil {
+				log.Println("decrypt error:", err)
+				continue
+			}
+			var p ProxyType
+			if err := p.UnmarshalBinary(data); err != nil {
+				log.Println("unmarshal error:", err)
+				continue
+			}
+			switch p.Type {
+			case 1:
+				state.handleTCP(p)
+			case 0:
+				state.handleUDP(p)
 			}
 		}
-	}()
-	// 启动多协程消费消息（并发处理TCP请求）
-	workerCount := 4 // 根据CPU调整
-	var wg sync.WaitGroup
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for data := range msgChan {
-				wsTCP(wsConn, data, &sessionMu, wsCtx, tcpSessions)
-			}
-		}()
 	}
-	// WS 关闭时清理
-	cleanupDone := make(chan struct{})
-	defer func() {
-		close(stopChan)
-		close(cleanupDone)
-		wg.Wait() // 等待所有worker处理完成
-		sessionMu.Lock()
-		for _, s := range tcpSessions {
-			if s.conn != nil {
-				s.conn.Close()
-			}
-		}
-		sessionMu.Unlock()
-	}()
-
-	// 启动清理协程（包含心跳检测）
-	go sessionCleanupLoop(&sessionMu, tcpSessions, cleanupDone)
-	// 启动心跳发送协程（服务端主动心跳）
-	go heartbeatSendLoop(wsConn, wsCtx, stopChan)
-
-	// 等待worker完成
-	wg.Wait()
 }
 
 func WebsocketServer() {
 	mux := http.NewServeMux()
-	// path
 	mux.HandleFunc(WebSocketPath, websocketHandler)
-	mux.HandleFunc("/stats", statsHandler) // ← 新增统计接口
+	mux.HandleFunc("/stats", statsHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"code": 200, "message": "视频流已启动"}`)
+		fmt.Fprint(w, `{"code":200,"message":"websocket proxy server"}`)
 	})
-	server := &http.Server{
-		Addr:           ":43832",
-		Handler:        mux,
-		ReadTimeout:    10 * time.Second, // 防止慢攻击
-		WriteTimeout:   10 * time.Second,
-		IdleTimeout:    120 * time.Second,
-		MaxHeaderBytes: 1 << 20, // 1MB
-	}
-	log.Println("Server is listening on :43832")
+	server := &http.Server{Addr: ":43832", Handler: mux, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
+	log.Println("server listening on :43832")
 	log.Fatal(server.ListenAndServe())
 }
 
-// 新增：统计接口
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	type stat struct {
-		FromClientBytes uint64 `json:"RX"`
-		ToClientBytes   uint64 `json:"TX"`
+		FromClientBytes uint64 `json:"rx"`
+		ToClientBytes   uint64 `json:"tx"`
 		ActiveSessions  int32  `json:"active_sessions"`
 	}
 	resp := struct {
-		//UDP       stat   `json:"udp"`
 		TCP       stat   `json:"tcp"`
+		UDP       stat   `json:"udp"`
 		Timestamp string `json:"timestamp"`
 	}{
-		/*
-			UDP: stat{
-				FromClientBytes: atomic.LoadUint64(&globalUDPFromClient),
-				ToClientBytes:   atomic.LoadUint64(&globalUDPToClient),
-				ActiveSessions:  atomic.LoadInt32(&globalUDPActive),
-			},
-		*/
-		TCP: stat{
-			FromClientBytes: atomic.LoadUint64(&globalTCPFromClient),
-			ToClientBytes:   atomic.LoadUint64(&globalTCPToClient),
-			ActiveSessions:  atomic.LoadInt32(&globalTCPActive),
-		},
+		TCP:       stat{FromClientBytes: atomic.LoadUint64(&globalTCPFromClient), ToClientBytes: atomic.LoadUint64(&globalTCPToClient), ActiveSessions: atomic.LoadInt32(&globalTCPActive)},
+		UDP:       stat{FromClientBytes: atomic.LoadUint64(&globalUDPFromClient), ToClientBytes: atomic.LoadUint64(&globalUDPToClient), ActiveSessions: atomic.LoadInt32(&globalUDPActive)},
 		Timestamp: time.Now().Format(time.RFC3339),
 	}
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Println("stats encode error:", err)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+type serverTunnelState struct {
+	wsConn      *websocket.Conn
+	writeMu     *sync.Mutex
+	sessionMu   sync.Mutex
+	tcpSessions map[string]*tcpProxySession
+	udpSessions map[string]*udpProxySession
+}
+
+func newServerTunnelState(wsConn *websocket.Conn, wsCtx *WSConnectionContext) *serverTunnelState {
+	return &serverTunnelState{
+		wsConn:      wsConn,
+		writeMu:     &wsCtx.writeMu,
+		tcpSessions: make(map[string]*tcpProxySession),
+		udpSessions: make(map[string]*udpProxySession),
 	}
 }
 
-// 服务端主动发送心跳
-func heartbeatSendLoop(wsConn *websocket.Conn, wsCtx *WSConnectionContext, stopChan chan struct{}) {
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
+func (s *serverTunnelState) closeAll() {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	for k, v := range s.tcpSessions {
+		if v.conn != nil {
+			_ = v.conn.Close()
+		}
+		delete(s.tcpSessions, k)
+		incTCPActive(-1)
+	}
+	for k, v := range s.udpSessions {
+		if v.conn != nil {
+			_ = v.conn.Close()
+		}
+		delete(s.udpSessions, k)
+		incUDPActive(-1)
+	}
+}
+
+func (s *serverTunnelState) writePacket(p ProxyType) error {
+	bin, err := p.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	enc, err := EncryptWithGzip(bin, Key)
+	if err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	return s.wsConn.WriteMessage(websocket.BinaryMessage, enc)
+}
+
+func (s *serverTunnelState) handleTCP(p ProxyType) {
+	if len(p.Payload) == 0 {
+		return
+	}
+	key := makeSessionKey("", p.Src, p.Dest)
+	s.sessionMu.Lock()
+	sess, ok := s.tcpSessions[key]
+	if !ok {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ipFromAddr(p.Dest).String(), fmt.Sprintf("%d", p.Dest.Port)), 10*time.Second)
+		if err != nil {
+			s.sessionMu.Unlock()
+			return
+		}
+		tcpConn := conn.(*net.TCPConn)
+		sess = &tcpProxySession{conn: tcpConn, src: p.Src, dest: p.Dest, LastActive: time.Now(), HeartbeatTime: time.Now()}
+		s.tcpSessions[key] = sess
+		incTCPActive(1)
+		go s.tcpReplyLoop(key, sess)
+	}
+	s.sessionMu.Unlock()
+
+	sess.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := sess.conn.Write(p.Payload); err == nil {
+		incTCPFromClient(uint64(len(p.Payload)))
+	}
+}
+
+func (s *serverTunnelState) tcpReplyLoop(key string, sess *tcpProxySession) {
+	defer func() {
+		s.sessionMu.Lock()
+		delete(s.tcpSessions, key)
+		s.sessionMu.Unlock()
+		incTCPActive(-1)
+		if sess.conn != nil {
+			_ = sess.conn.Close()
+		}
+	}()
+	buf := make([]byte, 16*1024)
 	for {
-		select {
-		case <-ticker.C:
-			// 发送空payload的TCP控制包作为心跳
-			heartbeatData := &ProxyType{
-				Type: 1,
-				Len:  0,
+		n, err := sess.conn.Read(buf)
+		if n > 0 {
+			incTCPToClient(uint64(n))
+			reply := ProxyType{Type: 1, Src: sess.dest, Dest: sess.src, Payload: append([]byte(nil), buf[:n]...)}
+			if err := s.writePacket(reply); err != nil {
+				return
 			}
-			bin, _ := heartbeatData.MarshalBinary()
-			enc, _ := EncryptWithGzip(bin, Key)
-			wsCtx.writeMu.Lock()
-			_ = wsConn.WriteMessage(websocket.BinaryMessage, enc)
-			wsCtx.writeMu.Unlock()
-		case <-stopChan:
+		}
+		if err != nil {
 			return
 		}
 	}
 }
 
-// 清理循环（增加心跳检测）
-func sessionCleanupLoop(sessionMu *sync.Mutex, tcpSessions map[string]*tcpProxySession, done chan struct{}) {
-	ticker := time.NewTicker(cleanupInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			cleanupIdleSessions(sessionMu, tcpSessions)
-		case <-done:
+func (s *serverTunnelState) handleUDP(p ProxyType) {
+	key := makeSessionKey("", p.Src, p.Dest)
+	s.sessionMu.Lock()
+	sess, ok := s.udpSessions[key]
+	if !ok {
+		remote := &net.UDPAddr{IP: ipFromAddr(p.Dest), Port: int(p.Dest.Port)}
+		conn, err := net.DialUDP("udp", nil, remote)
+		if err != nil {
+			s.sessionMu.Unlock()
 			return
+		}
+		sess = &udpProxySession{conn: conn, src: p.Src, dest: p.Dest, LastActive: time.Now()}
+		s.udpSessions[key] = sess
+		incUDPActive(1)
+		go s.udpReplyLoop(key, sess)
+	}
+	s.sessionMu.Unlock()
+
+	if len(p.Payload) > 0 {
+		if _, err := sess.conn.Write(p.Payload); err == nil {
+			incUDPFromClient(uint64(len(p.Payload)))
 		}
 	}
 }
 
-func cleanupIdleSessions(sessionMu *sync.Mutex, tcpSessions map[string]*tcpProxySession) {
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-	now := time.Now()
-	for k, s := range tcpSessions {
-		// 双重判断：空闲超时 或 心跳超时
-		idleTimeout := now.Sub(s.LastActive) > sessionTimeout
-		heartbeatTimeout := now.Sub(s.HeartbeatTime) > heartbeatTimeout
-		if idleTimeout || heartbeatTimeout {
-			if s.conn != nil {
-				s.conn.Close()
+func (s *serverTunnelState) udpReplyLoop(key string, sess *udpProxySession) {
+	defer func() {
+		s.sessionMu.Lock()
+		delete(s.udpSessions, key)
+		s.sessionMu.Unlock()
+		incUDPActive(-1)
+		if sess.conn != nil {
+			_ = sess.conn.Close()
+		}
+	}()
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := sess.conn.Read(buf)
+		if n > 0 {
+			incUDPToClient(uint64(n))
+			reply := ProxyType{Type: 0, Src: sess.dest, Dest: sess.src, Payload: append([]byte(nil), buf[:n]...)}
+			if err := s.writePacket(reply); err != nil {
+				return
 			}
-			delete(tcpSessions, k)
-			incTCPActive(-1)
+		}
+		if err != nil {
+			return
 		}
 	}
 }
