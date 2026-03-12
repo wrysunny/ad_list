@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,8 +16,8 @@ import (
 var upgrader = websocket.Upgrader{
 	HandshakeTimeout:  5 * time.Second,
 	EnableCompression: true,
-	ReadBufferSize:    1024 * 16,
-	WriteBufferSize:   1024 * 16,
+	ReadBufferSize:    16 * 1024,
+	WriteBufferSize:   16 * 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		h := r.Header.Get("Origin")
 		return h == "" || h == "chrome-extension://enmpedlkjjjnhoehlkkghdjiloebecpn" || strings.Contains(strings.ToLower(h), trustDomain)
@@ -36,15 +35,25 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) {
 	wsCtx := &WSConnectionContext{SessionPrefix: generateSessionPrefix()}
 	state := newServerTunnelState(wsConn, wsCtx)
 	defer state.closeAll()
+	go state.cleanupLoop()
+
+	_ = wsConn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	wsConn.SetPongHandler(func(string) error {
+		_ = wsConn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		return nil
+	})
 
 	for {
 		t, payload, err := wsConn.ReadMessage()
 		if err != nil {
 			return
 		}
+		_ = wsConn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+
 		switch t {
 		case websocket.PingMessage:
 			state.writeMu.Lock()
+			_ = wsConn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			_ = wsConn.WriteMessage(websocket.PongMessage, payload)
 			state.writeMu.Unlock()
 		case websocket.BinaryMessage:
@@ -77,36 +86,29 @@ func WebsocketServer() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, `{"code":200,"message":"websocket proxy server"}`)
 	})
-	server := &http.Server{Addr: ":43832", Handler: mux, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
+	server := &http.Server{
+		Addr:         ":43832",
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 	log.Println("server listening on :43832")
 	log.Fatal(server.ListenAndServe())
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	type stat struct {
-		FromClientBytes uint64 `json:"rx"`
-		ToClientBytes   uint64 `json:"tx"`
-		ActiveSessions  int32  `json:"active_sessions"`
-	}
-	resp := struct {
-		TCP       stat   `json:"tcp"`
-		UDP       stat   `json:"udp"`
-		Timestamp string `json:"timestamp"`
-	}{
-		TCP:       stat{FromClientBytes: atomic.LoadUint64(&globalTCPFromClient), ToClientBytes: atomic.LoadUint64(&globalTCPToClient), ActiveSessions: atomic.LoadInt32(&globalTCPActive)},
-		UDP:       stat{FromClientBytes: atomic.LoadUint64(&globalUDPFromClient), ToClientBytes: atomic.LoadUint64(&globalUDPToClient), ActiveSessions: atomic.LoadInt32(&globalUDPActive)},
-		Timestamp: time.Now().Format(time.RFC3339),
-	}
-	_ = json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(currentStats())
 }
 
 type serverTunnelState struct {
 	wsConn      *websocket.Conn
 	writeMu     *sync.Mutex
-	sessionMu   sync.Mutex
+	sessionMu   sync.RWMutex
 	tcpSessions map[string]*tcpProxySession
 	udpSessions map[string]*udpProxySession
+	closed      chan struct{}
 }
 
 func newServerTunnelState(wsConn *websocket.Conn, wsCtx *WSConnectionContext) *serverTunnelState {
@@ -115,10 +117,18 @@ func newServerTunnelState(wsConn *websocket.Conn, wsCtx *WSConnectionContext) *s
 		writeMu:     &wsCtx.writeMu,
 		tcpSessions: make(map[string]*tcpProxySession),
 		udpSessions: make(map[string]*udpProxySession),
+		closed:      make(chan struct{}),
 	}
 }
 
 func (s *serverTunnelState) closeAll() {
+	select {
+	case <-s.closed:
+		return
+	default:
+		close(s.closed)
+	}
+
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	for k, v := range s.tcpSessions {
@@ -137,6 +147,50 @@ func (s *serverTunnelState) closeAll() {
 	}
 }
 
+func (s *serverTunnelState) cleanupLoop() {
+	t := time.NewTicker(cleanupInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-t.C:
+			s.cleanupExpiredSessions()
+		}
+	}
+}
+
+func (s *serverTunnelState) cleanupExpiredSessions() {
+	now := time.Now()
+
+	s.sessionMu.Lock()
+	for k, sess := range s.tcpSessions {
+		sess.mu.Lock()
+		stale := now.Sub(sess.LastActive) > tcpSessionTimeout
+		sess.mu.Unlock()
+		if stale {
+			if sess.conn != nil {
+				_ = sess.conn.Close()
+			}
+			delete(s.tcpSessions, k)
+			incTCPActive(-1)
+		}
+	}
+	for k, sess := range s.udpSessions {
+		sess.mu.Lock()
+		stale := now.Sub(sess.LastActive) > udpSessionTimeout
+		sess.mu.Unlock()
+		if stale {
+			if sess.conn != nil {
+				_ = sess.conn.Close()
+			}
+			delete(s.udpSessions, k)
+			incUDPActive(-1)
+		}
+	}
+	s.sessionMu.Unlock()
+}
+
 func (s *serverTunnelState) writePacket(p ProxyType) error {
 	bin, err := p.MarshalBinary()
 	if err != nil {
@@ -148,7 +202,7 @@ func (s *serverTunnelState) writePacket(p ProxyType) error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	s.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	_ = s.wsConn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 	return s.wsConn.WriteMessage(websocket.BinaryMessage, enc)
 }
 
@@ -157,10 +211,11 @@ func (s *serverTunnelState) handleTCP(p ProxyType) {
 		return
 	}
 	key := makeSessionKey("", p.Src, p.Dest)
+
 	s.sessionMu.Lock()
 	sess, ok := s.tcpSessions[key]
 	if !ok {
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ipFromAddr(p.Dest).String(), fmt.Sprintf("%d", p.Dest.Port)), 10*time.Second)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ipFromAddr(p.Dest).String(), fmt.Sprintf("%d", p.Dest.Port)), tcpDialTimeout)
 		if err != nil {
 			s.sessionMu.Unlock()
 			return
@@ -173,10 +228,15 @@ func (s *serverTunnelState) handleTCP(p ProxyType) {
 	}
 	s.sessionMu.Unlock()
 
-	sess.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if _, err := sess.conn.Write(p.Payload); err == nil {
+	sess.mu.Lock()
+	_ = sess.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	_, err := sess.conn.Write(p.Payload)
+	if err == nil {
+		sess.LastActive = time.Now()
+		sess.HeartbeatTime = time.Now()
 		incTCPFromClient(uint64(len(p.Payload)))
 	}
+	sess.mu.Unlock()
 }
 
 func (s *serverTunnelState) tcpReplyLoop(key string, sess *tcpProxySession) {
@@ -189,9 +249,17 @@ func (s *serverTunnelState) tcpReplyLoop(key string, sess *tcpProxySession) {
 			_ = sess.conn.Close()
 		}
 	}()
+
 	buf := make([]byte, 16*1024)
 	for {
+		sess.mu.Lock()
+		_ = sess.conn.SetReadDeadline(time.Now().Add(tcpSessionTimeout))
 		n, err := sess.conn.Read(buf)
+		if n > 0 {
+			sess.LastActive = time.Now()
+			sess.HeartbeatTime = time.Now()
+		}
+		sess.mu.Unlock()
 		if n > 0 {
 			incTCPToClient(uint64(n))
 			reply := ProxyType{Type: 1, Src: sess.dest, Dest: sess.src, Payload: append([]byte(nil), buf[:n]...)}
@@ -216,6 +284,7 @@ func (s *serverTunnelState) handleUDP(p ProxyType) {
 			s.sessionMu.Unlock()
 			return
 		}
+		_ = conn.SetDeadline(time.Now().Add(udpDialTimeout))
 		sess = &udpProxySession{conn: conn, src: p.Src, dest: p.Dest, LastActive: time.Now()}
 		s.udpSessions[key] = sess
 		incUDPActive(1)
@@ -224,9 +293,14 @@ func (s *serverTunnelState) handleUDP(p ProxyType) {
 	s.sessionMu.Unlock()
 
 	if len(p.Payload) > 0 {
-		if _, err := sess.conn.Write(p.Payload); err == nil {
+		sess.mu.Lock()
+		_ = sess.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+		_, err := sess.conn.Write(p.Payload)
+		if err == nil {
+			sess.LastActive = time.Now()
 			incUDPFromClient(uint64(len(p.Payload)))
 		}
+		sess.mu.Unlock()
 	}
 }
 
@@ -242,7 +316,13 @@ func (s *serverTunnelState) udpReplyLoop(key string, sess *udpProxySession) {
 	}()
 	buf := make([]byte, 64*1024)
 	for {
+		sess.mu.Lock()
+		_ = sess.conn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
 		n, err := sess.conn.Read(buf)
+		if n > 0 {
+			sess.LastActive = time.Now()
+		}
+		sess.mu.Unlock()
 		if n > 0 {
 			incUDPToClient(uint64(n))
 			reply := ProxyType{Type: 0, Src: sess.dest, Dest: sess.src, Payload: append([]byte(nil), buf[:n]...)}

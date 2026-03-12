@@ -6,7 +6,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"fmt"
 	"io"
 )
@@ -79,11 +78,4 @@ func DecryptWithGzip(data []byte, key []byte) ([]byte, error) {
 		return nil, err
 	}
 	return decompressedBuf.Bytes(), nil
-}
-
-func CalcSha256(password string) []byte {
-	hash := sha256.New()
-	hash.Write([]byte(password))
-	h := hash.Sum(nil)
-	return h
 }

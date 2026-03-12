@@ -3,6 +3,7 @@ package websocket_proxy
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -13,13 +14,21 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type wsWorker struct {
+	id     int
+	conn   *websocket.Conn
+	writeM sync.Mutex
+}
+
 type socksClient struct {
-	wsConn      *websocket.Conn
-	writeMu     sync.Mutex
+	workers  []*wsWorker
+	workerMu sync.RWMutex
+
 	tcpMu       sync.RWMutex
 	tcpSessions map[string]net.Conn
-	udpMu       sync.RWMutex
-	udpAssoc    *udpAssociation
+
+	udpMu    sync.RWMutex
+	udpAssoc *udpAssociation
 }
 
 type udpAssociation struct {
@@ -32,19 +41,17 @@ func RunSocks5Client(serverURL, listenAddr string) error {
 	if err != nil {
 		return err
 	}
-	ws, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-	if err != nil {
+	c := &socksClient{tcpSessions: make(map[string]net.Conn)}
+
+	if err := c.initWorkers(u.String(), defaultWorkerCount); err != nil {
 		return err
 	}
-
-	c := &socksClient{wsConn: ws, tcpSessions: make(map[string]net.Conn)}
-	go c.readLoop()
 
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return err
 	}
-	log.Println("socks5 listening on", listenAddr)
+	log.Println("socks5 listening on", listenAddr, "workers:", defaultWorkerCount)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -54,12 +61,55 @@ func RunSocks5Client(serverURL, listenAddr string) error {
 	}
 }
 
-func (c *socksClient) readLoop() {
+func (c *socksClient) initWorkers(serverURL string, n int) error {
+	if n <= 0 {
+		n = 1
+	}
+	workers := make([]*wsWorker, 0, n)
+	for i := 0; i < n; i++ {
+		ws, _, err := websocket.DefaultDialer.Dial(serverURL, nil)
+		if err != nil {
+			for _, w := range workers {
+				_ = w.conn.Close()
+			}
+			return fmt.Errorf("dial worker %d failed: %w", i, err)
+		}
+		w := &wsWorker{id: i, conn: ws}
+		workers = append(workers, w)
+		go c.readLoop(w)
+	}
+	c.workerMu.Lock()
+	c.workers = workers
+	c.workerMu.Unlock()
+	return nil
+}
+
+func (c *socksClient) chooseWorker(sessionKey string) *wsWorker {
+	c.workerMu.RLock()
+	defer c.workerMu.RUnlock()
+	if len(c.workers) == 0 {
+		return nil
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(sessionKey))
+	idx := int(h.Sum32()) % len(c.workers)
+	return c.workers[idx]
+}
+
+func (c *socksClient) readLoop(w *wsWorker) {
+	_ = w.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+	w.conn.SetPongHandler(func(string) error {
+		_ = w.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+		return nil
+	})
+
 	for {
-		_, payload, err := c.wsConn.ReadMessage()
+		_, payload, err := w.conn.ReadMessage()
 		if err != nil {
 			return
 		}
+		_ = w.conn.SetReadDeadline(time.Now().Add(wsReadTimeout))
+
 		dec, err := DecryptWithGzip(payload, Key)
 		if err != nil {
 			continue
@@ -89,7 +139,7 @@ func (c *socksClient) readLoop() {
 	}
 }
 
-func (c *socksClient) sendPacket(p ProxyType) error {
+func (c *socksClient) sendPacket(sessionKey string, p ProxyType) error {
 	bin, err := p.MarshalBinary()
 	if err != nil {
 		return err
@@ -98,10 +148,14 @@ func (c *socksClient) sendPacket(p ProxyType) error {
 	if err != nil {
 		return err
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	c.wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	return c.wsConn.WriteMessage(websocket.BinaryMessage, enc)
+	worker := c.chooseWorker(sessionKey)
+	if worker == nil {
+		return fmt.Errorf("no websocket workers available")
+	}
+	worker.writeM.Lock()
+	defer worker.writeM.Unlock()
+	_ = worker.conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	return worker.conn.WriteMessage(websocket.BinaryMessage, enc)
 }
 
 func (c *socksClient) handleSocksConn(conn net.Conn) {
@@ -168,10 +222,11 @@ func (c *socksClient) handleConnect(conn net.Conn, host string, port int) error 
 
 	buf := make([]byte, 16*1024)
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(tcpSessionTimeout))
 		n, err := conn.Read(buf)
 		if n > 0 {
 			p := ProxyType{Type: 1, Src: src, Dest: dst, Payload: append([]byte(nil), buf[:n]...)}
-			if err := c.sendPacket(p); err != nil {
+			if err := c.sendPacket(key, p); err != nil {
 				return err
 			}
 		}
@@ -216,6 +271,7 @@ func (c *socksClient) handleUDPAssociate(conn net.Conn) error {
 
 	buf := make([]byte, 64*1024)
 	for {
+		_ = udpConn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
 		n, clientAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			return err
@@ -233,8 +289,10 @@ func (c *socksClient) handleUDPAssociate(conn net.Conn) error {
 			continue
 		}
 		assoc.clientAddr = clientAddr
-		p := ProxyType{Type: 0, Src: addrFromUDPAddr(clientAddr), Dest: addrFromIPPort(dstIP, dport), Payload: payload}
-		if err := c.sendPacket(p); err != nil {
+		src := addrFromUDPAddr(clientAddr)
+		dst := addrFromIPPort(dstIP, dport)
+		p := ProxyType{Type: 0, Src: src, Dest: dst, Payload: payload}
+		if err := c.sendPacket(makeSessionKey("", src, dst), p); err != nil {
 			return err
 		}
 	}

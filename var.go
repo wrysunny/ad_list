@@ -2,6 +2,7 @@ package websocket_proxy
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -16,7 +17,6 @@ var (
 	trustDomain   string = "speedtest.synology.pub"
 	WebSocketPath string = "/security_stream_link/2987/t"
 
-	// 全局流量统计（atomic 无锁高性能）
 	globalUDPFromClient uint64
 	globalUDPToClient   uint64
 	globalUDPActive     int32
@@ -25,19 +25,31 @@ var (
 	globalTCPActive     int32
 )
 
-// 新增：WS连接级会话标识
+const (
+	wsReadTimeout      = 45 * time.Second
+	wsWriteTimeout     = 10 * time.Second
+	tcpSessionTimeout  = 120 * time.Second
+	udpSessionTimeout  = 60 * time.Second
+	cleanupInterval    = 15 * time.Second
+	tcpDialTimeout     = 10 * time.Second
+	udpDialTimeout     = 5 * time.Second
+	defaultWorkerCount = 4
+)
+
+// WS连接级会话标识
 type WSConnectionContext struct {
-	SessionPrefix string     // 每个WS连接随机前缀，防止key冲突
-	writeMu       sync.Mutex // 保留写锁，但每个WS连接独立
+	SessionPrefix string
+	writeMu       sync.Mutex
 }
 
 type addr struct {
 	Address [16]byte
 	Port    uint16
 }
+
 type ProxyType struct {
 	Type      uint8  // udp 0 tcp 1
-	Len       uint16 // length
+	Len       uint16 // payload length
 	Src       addr
 	Dest      addr
 	Payload   []byte
@@ -45,6 +57,7 @@ type ProxyType struct {
 }
 
 type udpProxySession struct {
+	mu         sync.Mutex
 	conn       *net.UDPConn
 	src        addr
 	dest       addr
@@ -52,6 +65,7 @@ type udpProxySession struct {
 }
 
 type tcpProxySession struct {
+	mu            sync.Mutex
 	conn          *net.TCPConn
 	src           addr
 	dest          addr
@@ -66,7 +80,6 @@ func generateSessionPrefix() string {
 	return hex.EncodeToString(b)
 }
 
-// 会话唯一 key（支持端口复用）
 func makeSessionKey(prefix string, src, dest addr) string {
 	return fmt.Sprintf("%s_%x:%d->%x:%d", prefix, src.Address[:], src.Port, dest.Address[:], dest.Port)
 }
@@ -82,3 +95,24 @@ func incUDPActive(delta int32)      { atomic.AddInt32(&globalUDPActive, delta) }
 func incTCPFromClient(delta uint64) { atomic.AddUint64(&globalTCPFromClient, delta) }
 func incTCPToClient(delta uint64)   { atomic.AddUint64(&globalTCPToClient, delta) }
 func incTCPActive(delta int32)      { atomic.AddInt32(&globalTCPActive, delta) }
+
+func currentStats() map[string]any {
+	return map[string]any{
+		"tcp": map[string]any{
+			"rx":              atomic.LoadUint64(&globalTCPFromClient),
+			"tx":              atomic.LoadUint64(&globalTCPToClient),
+			"active_sessions": atomic.LoadInt32(&globalTCPActive),
+		},
+		"udp": map[string]any{
+			"rx":              atomic.LoadUint64(&globalUDPFromClient),
+			"tx":              atomic.LoadUint64(&globalUDPToClient),
+			"active_sessions": atomic.LoadInt32(&globalUDPActive),
+		},
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+}
+
+func CalcSha256(password string) []byte {
+	h := sha256.Sum256([]byte(password))
+	return h[:]
+}
